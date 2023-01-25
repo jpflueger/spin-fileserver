@@ -6,7 +6,7 @@ use http::{
 };
 use spin_sdk::http::{not_found, Request, Response};
 use std::{
-    collections::hash_map::DefaultHasher,
+    collections::{hash_map::DefaultHasher, HashMap},
     fs::File,
     hash::{Hash, Hasher},
     io::Read,
@@ -25,6 +25,8 @@ const BROTLI_LEVEL: u32 = 3;
 const BROTLI_ENCODING: &str = "br";
 /// The path info header.
 const PATH_INFO_HEADER: &str = "spin-path-info";
+/// The path into rewrite rules
+const PATH_REWRITES: &str = "PATH_REWRITES";
 
 /// Common Content Encodings
 #[derive(Debug, Eq, PartialEq)]
@@ -72,12 +74,9 @@ fn serve(req: Request) -> Result<Response> {
         .map(|h| h.to_str())
         .unwrap_or(Ok(""))?;
 
-    let path = match path {
-        "/" => "index.html",
-        _ => path,
-    };
+    let path = FileServer::rewrite(path);
 
-    let body = match FileServer::read(path, &enc) {
+    let body = match FileServer::read(&path, &enc) {
         Ok(b) => Some(b),
         Err(e) => {
             eprintln!("Cannot read file: {:?}", e);
@@ -86,7 +85,7 @@ fn serve(req: Request) -> Result<Response> {
     };
 
     let etag = FileServer::get_etag(body.clone());
-    FileServer::send(body, path, enc, &etag, if_none_match)
+    FileServer::send(body, &path, enc, &etag, if_none_match)
 }
 
 struct FileServer;
@@ -159,6 +158,39 @@ impl FileServer {
         let mut state = DefaultHasher::new();
         body.unwrap_or_default().hash(&mut state);
         state.finish().to_string()
+    }
+
+    fn get_rewrites() -> HashMap<String, String> {
+        //TODO: can we statically initialize this with wizer?
+        match std::env::var(PATH_REWRITES) {
+            Ok(rewrites) => rewrites
+                .split('\n')
+                .flat_map(|line| {
+                    let rule = line
+                        .trim()
+                        .split_ascii_whitespace()
+                        .map(|r| r.trim())
+                        .collect::<Vec<_>>();
+                    if rule.len() != 2 {
+                        // parsing failed, log the error and move on
+                        eprintln!("URL Rewrite: Incorrect format for rule '{:?}'", rule);
+                        None
+                    } else {
+                        println!("URL Rewrite: Parsed rule '{:?}'", rule);
+                        Some((rule[0].to_owned(), rule[1].to_owned()))
+                    }
+                })
+                .collect::<HashMap<String, String>>(),
+            Err(_) => HashMap::from([("/".to_string(), "index.html".to_string())]),
+        }
+    }
+
+    fn rewrite(path: &str) -> String {
+        match FileServer::get_rewrites().get(path) {
+            Some(p) => p.to_owned(),
+            // use the path as-is if no rewrite rule matches
+            None => path.to_string(),
+        }
     }
 }
 
@@ -262,6 +294,40 @@ mod tests {
         };
         let rsp = <super::SpinHttp as spin_http::SpinHttp>::handle_http_request(req);
         assert_eq!(rsp.status, 404);
+    }
+
+    #[test]
+    fn test_serve_rewrite() {
+        std::env::set_var(
+            PATH_REWRITES,
+            "
+        /about index.html
+        ",
+        );
+
+        // assert the rewrite works
+        let req = spin_http::Request {
+            method: spin_http::Method::Get,
+            uri: "http://thisistest.com/about".to_string(),
+            headers: vec![(PATH_INFO_HEADER.to_string(), "/about".to_string())],
+            params: vec![],
+            body: None,
+        };
+        let rsp = <super::SpinHttp as spin_http::SpinHttp>::handle_http_request(req);
+        assert_eq!(rsp.status, 200);
+
+        // assert that any rule not in the variable is not processed
+        let req = spin_http::Request {
+            method: spin_http::Method::Get,
+            uri: "http://thisistest.com/".to_string(),
+            headers: vec![(PATH_INFO_HEADER.to_string(), "/".to_string())],
+            params: vec![],
+            body: None,
+        };
+        let rsp = <super::SpinHttp as spin_http::SpinHttp>::handle_http_request(req);
+        assert_eq!(rsp.status, 404);
+
+        std::env::remove_var("PATH_REWRITES");
     }
 
     #[test]
